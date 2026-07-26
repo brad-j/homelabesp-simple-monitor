@@ -1,0 +1,12 @@
+.pio/
+.venv/
+.DS_Store
+*.log
+
+# Local deployment configuration and secrets.
+include/config.h
+include/secrets.h
+
+# Device images may contain credentials, keys, or proprietary firmware.
+backups/*
+!backups/*.sha256
