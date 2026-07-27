@@ -1,6 +1,6 @@
 # Homelab Panel
 
-A dedicated ESP32 touchscreen for read-only Docker and Beszel monitoring, with a security boundary for future guarded recovery actions.
+A dedicated ESP32 touchscreen for read-only Docker and Beszel monitoring with local Billerica weather.
 
 ## Hardware
 
@@ -27,14 +27,15 @@ The flashed and verified production firmware provides:
 - Beszel system metrics refreshed every 60 seconds
 - Current CPU, memory, disk, temperature, load, and network throughput
 - Tappable system cards with 60-minute CPU/memory charts
-- Overview, Systems, read-only Actions-boundary, and Device screens
+- Billerica current conditions and five-day Open-Meteo forecast refreshed every 15 minutes
+- Overview, Systems, Issues, Device, and Weather screens
 - Backlight dim after 2 minutes, off after 10 minutes, and touch-to-wake
 - Wi-Fi modem sleep disabled for predictable latency while USB-powered
 
 The production build has been validated on the target hardware within its
 available RAM and dual-OTA application-slot limits.
 
-The Actions screen is intentionally read-only. Control requires a separate authenticated allow-list API, validated transport, scoped credentials, and hold-to-confirm interaction.
+The firmware is intentionally observation-only. Control requires a separate authenticated allow-list API, validated transport, scoped credentials, and hold-to-confirm interaction.
 
 Hardware verification remains available as separate PlatformIO environments:
 
@@ -145,12 +146,15 @@ The dedicated Beszel SSH key is restricted to the redacted snapshot command. The
 
 The ESP32 stores no upstream administrator credentials. A future control API must use validated transport, scoped authentication, an operation allow-list, and on-device hold-to-confirm for destructive actions.
 
+Weather is fetched directly from Open-Meteo for Billerica, Massachusetts (`42.55843, -71.26895`) in Fahrenheit and mph. The ESP32 TLS client does not validate the public weather server certificate because this constrained firmware has no maintained CA bundle. Weather data is public and read-only, but a hostile network could alter it.
+
 Current UI:
 
 1. **Overview** — overall state, Docker host reachability, workload count, and active issues.
 2. **Systems** — touch cards for configured systems showing CPU/memory. Tap one for CPU, memory, disk, hottest available temperature, load, RX/TX, and a 60-minute CPU/memory graph.
-3. **Actions** — explicit read-only security boundary; no infrastructure controls exist yet.
-4. **Device** — SSID, IP address, RSSI, uptime, free heap, and PSRAM status.
+3. **Issues** — unreachable hosts and systems, unhealthy workloads, stale feeds, and warning/critical CPU, memory, disk, or temperature conditions. A nominal state confirms both feeds are current.
+4. **Device** — hardware identity, uptime, free heap, and client security state.
+5. **Weather** — Billerica temperature, conditions, apparent temperature, humidity, wind, pressure, and five-day high/low/rain forecast.
 
 Production firmware uses LVGL with a 19.2 KB partial draw buffer sized for this no-PSRAM board. Networking uses direct REST; MQTT can be added later.
 
@@ -161,7 +165,7 @@ Applied lessons from [10 Useful ESP32 Concepts](https://www.etechnophiles.com/es
 - Wi-Fi modem sleep is disabled because the panel is USB-powered and values predictable request latency over power savings.
 - The dual-OTA `min_spiffs` partition layout reserves two 1.875 MB application slots. OTA remains disabled until an authenticated, integrity-checked update path exists.
 - LVGL uses a partial buffer. TFT DMA remains off until profiling shows display flushes are the bottleneck; enabling DMA speculatively would complicate buffer ownership.
-- Network polling remains on the Arduino loop while LAN requests are short. A pinned FreeRTOS worker is the next step only if measured refreshes stall touch or rendering.
+- Snapshot and weather polling remain on the Arduino loop. Weather refreshes only every 15 minutes; a pinned FreeRTOS worker is the next step only if measured requests stall touch or rendering.
 - Deep sleep is intentionally avoided. Backlight-only sleep preserves immediate touch wake and current network state.
 - ESP-NOW, DAC, Bluetooth coexistence, and an async web server are not needed for this client-only appliance.
 

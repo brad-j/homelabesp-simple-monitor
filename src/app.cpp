@@ -1,6 +1,6 @@
-/* Hallmark · pre-emit critique: P5 H5 E4 S5 R5 V4
+/* Hallmark · pre-emit critique: P5 H5 E5 S5 R5 V5
  * genre: modern-minimal · macrostructure: Workbench
- * theme: Cobalt-dark · enrichment: live metrics · navigation: bottom instrument rail
+ * theme: Cobalt-dark · enrichment: live topology + vector weather glyphs · navigation: bottom instrument rail
  * audience: homelab operators · use: health and guarded recovery · tone: technical
  * Hardware constraint: LVGL built-in Montserrat avoids external font assets on 4 MB/no-PSRAM.
  */
@@ -10,6 +10,7 @@
 #include <HTTPClient.h>
 #include <TFT_eSPI.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <WiFiManager.h>
 #include <esp_system.h>
 #include <lvgl.h>
@@ -54,11 +55,24 @@ constexpr uint32_t COLOR_DANGER = 0xFF7373;
 
 constexpr char SNAPSHOT_URL[] = HOMELAB_DOCKER_SNAPSHOT_URL;
 constexpr char METRICS_URL[] = HOMELAB_BESZEL_METRICS_URL;
+constexpr char WEATHER_URL[] =
+    "https://api.open-meteo.com/v1/forecast"
+    "?latitude=42.55843&longitude=-71.26895"
+    "&current=temperature_2m,relative_humidity_2m,apparent_temperature,"
+    "weather_code,pressure_msl,wind_speed_10m,wind_direction_10m,wind_gusts_10m"
+    "&daily=weather_code,temperature_2m_max,temperature_2m_min,"
+    "precipitation_probability_max"
+    "&temperature_unit=fahrenheit&wind_speed_unit=mph"
+    "&timezone=America%2FNew_York&forecast_days=5";
 constexpr uint32_t REFRESH_INTERVAL_MS = 30000;
 constexpr uint32_t METRICS_REFRESH_INTERVAL_MS = 60000;
+constexpr uint32_t WEATHER_REFRESH_INTERVAL_MS = 15UL * 60UL * 1000UL;
+constexpr uint32_t WEATHER_RETRY_INTERVAL_MS = 60UL * 1000UL;
 constexpr uint8_t MAX_HOSTS = 4;
 constexpr uint8_t MAX_METRIC_SYSTEMS = 6;
+constexpr uint8_t MAX_DOCKER_ISSUES = 8;
 constexpr uint8_t METRIC_HISTORY_POINTS = 60;
+constexpr uint8_t FORECAST_DAYS = 5;
 constexpr uint16_t DRAW_BUFFER_LINES = 20;
 
 struct HostSummary {
@@ -68,16 +82,24 @@ struct HostSummary {
   uint8_t issues = 0;
 };
 
+struct DockerIssue {
+  char subject[20] = "—";
+  char detail[36] = "—";
+  uint32_t severityColor = COLOR_WARNING;
+};
+
 struct Snapshot {
   bool ready = false;
   bool loading = true;
   char error[72] = "Waiting for the first snapshot";
   char generatedAt[32] = "—";
   HostSummary hosts[MAX_HOSTS];
+  DockerIssue issueDetails[MAX_DOCKER_ISSUES];
   uint8_t hostCount = 0;
   uint8_t reachableHosts = 0;
   uint8_t workloads = 0;
   uint8_t issues = 0;
+  uint8_t issueDetailCount = 0;
   uint32_t fetchedAt = 0;
 };
 
@@ -107,21 +129,48 @@ struct MetricsSnapshot {
   uint32_t fetchedAt = 0;
 };
 
-enum class Page : uint8_t { OVERVIEW, SYSTEMS, ACTIONS, DEVICE };
+struct DayForecast {
+  char date[11] = "";
+  int16_t code = -1;
+  float high = NAN;
+  float low = NAN;
+  int16_t precipitation = -1;
+};
+
+struct WeatherSnapshot {
+  bool ready = false;
+  bool loading = true;
+  char error[72] = "Waiting for weather data";
+  char observedAt[17] = "";
+  float temperature = NAN;
+  float apparent = NAN;
+  float humidity = NAN;
+  float wind = NAN;
+  float gust = NAN;
+  float pressure = NAN;
+  int16_t windDirection = -1;
+  int16_t code = -1;
+  DayForecast days[FORECAST_DAYS];
+  uint32_t fetchedAt = 0;
+};
+
+enum class Page : uint8_t { OVERVIEW, SYSTEMS, ISSUES, DEVICE, WEATHER };
 
 TFT_eSPI display;
 lv_disp_draw_buf_t drawBuffer;
 lv_color_t drawPixels[SCREEN_WIDTH * DRAW_BUFFER_LINES];
 lv_obj_t *content = nullptr;
 lv_obj_t *networkLabel = nullptr;
-lv_obj_t *navButtons[4] = {};
+lv_obj_t *navButtons[5] = {};
 Snapshot snapshot;
 MetricsSnapshot metrics;
+WeatherSnapshot weather;
 Page currentPage = Page::OVERVIEW;
 int8_t selectedMetricSystem = -1;
 uint32_t lastInteractionAt = 0;
 uint32_t lastRefreshAt = 0;
 uint32_t lastMetricsRefreshAt = 0;
+uint32_t lastWeatherAttemptAt = 0;
 bool screenOff = false;
 bool suppressTouchUntilRelease = false;
 
@@ -223,7 +272,8 @@ lv_obj_t *makePanel(int16_t x, int16_t y, int16_t width, int16_t height) {
   return panel;
 }
 
-void makeSignal(lv_obj_t *parent, int16_t x, int16_t y, uint32_t signalColor) {
+lv_obj_t *makeSignal(lv_obj_t *parent, int16_t x, int16_t y,
+                     uint32_t signalColor) {
   lv_obj_t *signal = lv_obj_create(parent);
   clearObjectStyle(signal);
   lv_obj_set_pos(signal, x, y);
@@ -231,6 +281,7 @@ void makeSignal(lv_obj_t *parent, int16_t x, int16_t y, uint32_t signalColor) {
   lv_obj_set_style_bg_color(signal, color(signalColor), 0);
   lv_obj_set_style_bg_opa(signal, LV_OPA_COVER, 0);
   lv_obj_set_style_radius(signal, 1, 0);
+  return signal;
 }
 
 void formatMetric(char *output, size_t size, float value, const char *suffix) {
@@ -256,10 +307,67 @@ void formatRate(char *output, size_t size, float bytesPerSecond) {
 
 void renderCurrentPage();
 
+uint32_t metricIssueColor(const MetricSystem &system) {
+  if (!system.reachable) return COLOR_DANGER;
+  if (system.disk >= 95.0f || system.temperature >= 85.0f ||
+      system.memory >= 97.0f || system.cpu >= 98.0f)
+    return COLOR_DANGER;
+  if (system.disk >= 85.0f || system.temperature >= 75.0f ||
+      system.memory >= 90.0f || system.cpu >= 95.0f)
+    return COLOR_WARNING;
+  return 0;
+}
+
+void formatMetricIssue(char *output, size_t size, const MetricSystem &system) {
+  if (!system.reachable) {
+    strlcpy(output, "System unreachable", size);
+  } else if (system.disk >= 95.0f) {
+    snprintf(output, size, "Disk critical %.0f%%", system.disk);
+  } else if (system.temperature >= 85.0f) {
+    snprintf(output, size, "Temperature critical %.0f°", system.temperature);
+  } else if (system.memory >= 97.0f) {
+    snprintf(output, size, "Memory critical %.0f%%", system.memory);
+  } else if (system.cpu >= 98.0f) {
+    snprintf(output, size, "CPU critical %.0f%%", system.cpu);
+  } else if (system.disk >= 85.0f) {
+    snprintf(output, size, "Disk high %.0f%%", system.disk);
+  } else if (system.temperature >= 75.0f) {
+    snprintf(output, size, "Temperature high %.0f°", system.temperature);
+  } else if (system.memory >= 90.0f) {
+    snprintf(output, size, "Memory high %.0f%%", system.memory);
+  } else if (system.cpu >= 95.0f) {
+    snprintf(output, size, "CPU high %.0f%%", system.cpu);
+  } else {
+    output[0] = '\0';
+  }
+}
+
+bool feedIsStale(bool ready, uint32_t fetchedAt, uint32_t interval) {
+  return ready && fetchedAt != 0 && millis() - fetchedAt > interval * 3;
+}
+
+void formatFeedStatus(char *output, size_t size, bool ready, uint32_t fetchedAt,
+                      uint32_t interval) {
+  if (!ready || fetchedAt == 0) {
+    strlcpy(output, "OFFLINE", size);
+    return;
+  }
+  const uint32_t ageSeconds = (millis() - fetchedAt) / 1000UL;
+  if (ageSeconds > (interval * 3) / 1000UL) {
+    snprintf(output, size, "STALE · %lu min",
+             static_cast<unsigned long>(ageSeconds / 60UL));
+  } else {
+    snprintf(output, size, "LIVE · %lu s",
+             static_cast<unsigned long>(ageSeconds));
+  }
+}
+
 bool metricsHaveIssue() {
-  if (!metrics.ready) return false;
+  if (!metrics.ready || feedIsStale(metrics.ready, metrics.fetchedAt,
+                                    METRICS_REFRESH_INTERVAL_MS))
+    return true;
   for (uint8_t index = 0; index < metrics.systemCount; ++index) {
-    if (!metrics.systems[index].reachable) return true;
+    if (metricIssueColor(metrics.systems[index]) != 0) return true;
   }
   return false;
 }
@@ -281,7 +389,7 @@ uint32_t overallColor() {
 }
 
 void updateNavigation() {
-  for (uint8_t index = 0; index < 4; ++index) {
+  for (uint8_t index = 0; index < 5; ++index) {
     const bool active = index == static_cast<uint8_t>(currentPage);
     lv_obj_set_style_text_color(navButtons[index],
                                 color(active ? COLOR_ACCENT : COLOR_MUTED), 0);
@@ -291,68 +399,211 @@ void updateNavigation() {
   }
 }
 
+void setOpacityAnimationValue(void *target, int32_t value) {
+  lv_obj_set_style_opa(static_cast<lv_obj_t *>(target),
+                       static_cast<lv_opa_t>(value), 0);
+}
+
+void animateReveal(lv_obj_t *object, uint32_t delayMs) {
+  lv_obj_set_style_opa(object, LV_OPA_20, 0);
+  lv_anim_t animation;
+  lv_anim_init(&animation);
+  lv_anim_set_var(&animation, object);
+  lv_anim_set_exec_cb(&animation, setOpacityAnimationValue);
+  lv_anim_set_values(&animation, LV_OPA_20, LV_OPA_COVER);
+  lv_anim_set_time(&animation, 220);
+  lv_anim_set_delay(&animation, delayMs);
+  lv_anim_set_path_cb(&animation, lv_anim_path_ease_out);
+  lv_anim_start(&animation);
+}
+
+void animateSignal(lv_obj_t *signal, uint32_t delayMs) {
+  lv_anim_t animation;
+  lv_anim_init(&animation);
+  lv_anim_set_var(&animation, signal);
+  lv_anim_set_exec_cb(&animation, setOpacityAnimationValue);
+  lv_anim_set_values(&animation, LV_OPA_COVER, LV_OPA_40);
+  lv_anim_set_time(&animation, 720);
+  lv_anim_set_playback_time(&animation, 720);
+  lv_anim_set_repeat_count(&animation, LV_ANIM_REPEAT_INFINITE);
+  lv_anim_set_delay(&animation, delayMs);
+  lv_anim_start(&animation);
+}
+
 void renderOverview() {
-  lv_obj_t *statePanel = makePanel(10, 8, 278, 100);
-  makeSignal(statePanel, 12, 13, overallColor());
-  makeLabel(statePanel, "HOMELAB STATE", 28, 8, &lv_font_montserrat_14,
-            COLOR_MUTED);
-  makeLabel(statePanel, overallState(), 12, 31, &lv_font_montserrat_28,
-            overallColor());
+  makeLabel(content, "LIVE TOPOLOGY", 10, 3, &lv_font_montserrat_16,
+            COLOR_INK);
+  lv_obj_t *feedLabel =
+      makeLabel(content, snapshot.ready && metrics.ready ? "FEEDS · LIVE"
+                                                        : "FEEDS · DEGRADED",
+                0, 5, &lv_font_montserrat_14,
+                snapshot.ready && metrics.ready ? COLOR_OK : COLOR_WARNING);
+  lv_obj_align(feedLabel, LV_ALIGN_TOP_RIGHT, -10, 5);
 
-  char detail[52];
-  if (snapshot.ready) {
-    snprintf(detail, sizeof(detail), "%u/%u hosts · %u workloads",
-             snapshot.reachableHosts, snapshot.hostCount, snapshot.workloads);
-  } else {
-    strlcpy(detail, snapshot.loading ? "Loading snapshot…" : "Snapshot unavailable",
-            sizeof(detail));
+  const uint8_t reachability =
+      snapshot.ready && snapshot.hostCount
+          ? static_cast<uint8_t>((snapshot.reachableHosts * 100U) /
+                                 snapshot.hostCount)
+          : 0;
+  lv_obj_t *healthCore = lv_obj_create(content);
+  clearObjectStyle(healthCore);
+  lv_obj_set_pos(healthCore, 24, 27);
+  lv_obj_set_size(healthCore, 158, 158);
+  constexpr uint8_t RING_SEGMENTS = 24;
+  const uint8_t activeSegments =
+      static_cast<uint8_t>((reachability * RING_SEGMENTS) / 100U);
+  for (uint8_t index = 0; index < RING_SEGMENTS; ++index) {
+    const float angle = (120.0f + index * (300.0f / (RING_SEGMENTS - 1))) *
+                        PI / 180.0f;
+    const int16_t segmentX =
+        76 + static_cast<int16_t>(cosf(angle) * 67.0f) - 3;
+    const int16_t segmentY =
+        76 + static_cast<int16_t>(sinf(angle) * 67.0f) - 3;
+    lv_obj_t *segment = lv_obj_create(healthCore);
+    clearObjectStyle(segment);
+    lv_obj_set_pos(segment, segmentX, segmentY);
+    lv_obj_set_size(segment, 7, 7);
+    lv_obj_set_style_bg_color(
+        segment,
+        color(index < activeSegments ? overallColor() : COLOR_RULE), 0);
+    lv_obj_set_style_bg_opa(segment, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(segment, 1, 0);
+    if (index < activeSegments) animateReveal(segment, index * 24U);
   }
-  makeLabel(statePanel, detail, 12, 73, &lv_font_montserrat_14, COLOR_MUTED);
 
-  lv_obj_t *snapshotPanel = makePanel(298, 8, 172, 100);
-  makeLabel(snapshotPanel, "SNAPSHOT", 12, 8, &lv_font_montserrat_14,
-            COLOR_MUTED);
-  makeLabel(snapshotPanel, snapshot.ready ? "LIVE" : "—", 12, 31,
-            &lv_font_montserrat_24,
-            snapshot.ready ? COLOR_ACCENT : COLOR_MUTED);
-  makeLabel(snapshotPanel, snapshot.ready ? "30 s refresh" : "No data", 12, 72,
-            &lv_font_montserrat_14, COLOR_MUTED);
-
-  lv_obj_t *hostPanel = makePanel(10, 118, 278, 104);
-  makeLabel(hostPanel, "HOST LEDGER", 12, 7, &lv_font_montserrat_14,
-            COLOR_MUTED);
-  if (!snapshot.ready) {
-    makeLabel(hostPanel, "No host snapshot received.", 12, 43,
-              &lv_font_montserrat_16, COLOR_INK);
+  lv_obj_t *coreSignal = makeSignal(content, 99, 53, overallColor());
+  animateSignal(coreSignal, 0);
+  lv_obj_t *stateLabel = makeLabel(content, overallState(), 0, 0,
+                                   &lv_font_montserrat_20, overallColor());
+  lv_obj_align_to(stateLabel, healthCore, LV_ALIGN_CENTER, 0, -7);
+  char hostRatio[20];
+  if (snapshot.ready) {
+    snprintf(hostRatio, sizeof(hostRatio), "%u / %u HOSTS",
+             snapshot.reachableHosts, snapshot.hostCount);
   } else {
-    for (uint8_t index = 0; index < snapshot.hostCount && index < 3; ++index) {
+    strlcpy(hostRatio, "NO SNAPSHOT", sizeof(hostRatio));
+  }
+  lv_obj_t *ratioLabel = makeLabel(content, hostRatio, 0, 0,
+                                   &lv_font_montserrat_14, COLOR_MUTED);
+  lv_obj_align_to(ratioLabel, healthCore, LV_ALIGN_CENTER, 0, 19);
+
+  auto makeTrace = [&](int16_t x, int16_t y, int16_t width, int16_t height) {
+    lv_obj_t *trace = lv_obj_create(content);
+    clearObjectStyle(trace);
+    lv_obj_set_pos(trace, x, y);
+    lv_obj_set_size(trace, width, height);
+    lv_obj_set_style_bg_color(trace, color(COLOR_RULE), 0);
+    lv_obj_set_style_bg_opa(trace, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(trace, 1, 0);
+  };
+
+  constexpr int16_t NODE_X = 230;
+  constexpr int16_t NODE_START_Y = 34;
+  constexpr int16_t NODE_STEP = 37;
+  constexpr int16_t NODE_HEIGHT = 31;
+  const uint8_t visibleHosts = min<uint8_t>(snapshot.hostCount, MAX_HOSTS);
+  if (snapshot.ready && visibleHosts) {
+    const int16_t firstCenter = NODE_START_Y + NODE_HEIGHT / 2;
+    const int16_t lastCenter = firstCenter + (visibleHosts - 1) * NODE_STEP;
+    const int16_t trunkTop = min<int16_t>(firstCenter, 106);
+    const int16_t trunkBottom = max<int16_t>(lastCenter, 106);
+    makeTrace(177, 105, 32, 2);
+    makeTrace(207, trunkTop, 2, trunkBottom - trunkTop + 2);
+
+    for (uint8_t index = 0; index < visibleHosts; ++index) {
       const HostSummary &host = snapshot.hosts[index];
-      const int16_t rowY = 30 + index * 23;
-      makeSignal(hostPanel, 12, rowY + 5,
-                 host.reachable ? (host.issues ? COLOR_WARNING : COLOR_OK)
-                                : COLOR_DANGER);
-      makeLabel(hostPanel, host.name, 29, rowY, &lv_font_montserrat_14,
-                COLOR_INK);
-      char count[20];
-      snprintf(count, sizeof(count), "%u running", host.workloads);
-      lv_obj_t *countLabel = makeLabel(hostPanel, count, 0, rowY,
-                                       &lv_font_montserrat_14, COLOR_MUTED);
-      lv_obj_align(countLabel, LV_ALIGN_TOP_RIGHT, -12, rowY);
+      const int16_t nodeY = NODE_START_Y + index * NODE_STEP;
+      const int16_t nodeCenter = nodeY + NODE_HEIGHT / 2;
+      makeTrace(208, nodeCenter, NODE_X - 208, 2);
+
+      lv_obj_t *node = makePanel(NODE_X, nodeY, 240, NODE_HEIGHT);
+      const uint32_t nodeColor =
+          !host.reachable
+              ? COLOR_DANGER
+              : (host.issues ? COLOR_WARNING : COLOR_OK);
+      lv_obj_t *nodeSignal = makeSignal(node, 10, 12, nodeColor);
+      animateSignal(nodeSignal, 140U + index * 170U);
+      makeLabel(node, host.name, 25, 6, &lv_font_montserrat_16, COLOR_INK);
+      char nodeDetail[24];
+      if (host.reachable) {
+        snprintf(nodeDetail, sizeof(nodeDetail), "%u RUNNING", host.workloads);
+      } else {
+        strlcpy(nodeDetail, "UNREACHABLE", sizeof(nodeDetail));
+      }
+      lv_obj_t *detailLabel = makeLabel(node, nodeDetail, 0, 8,
+                                        &lv_font_montserrat_14, nodeColor);
+      lv_obj_align(detailLabel, LV_ALIGN_TOP_RIGHT, -10, 8);
+    }
+  } else {
+    makeTrace(177, 105, 32, 2);
+    lv_obj_t *waiting = makePanel(NODE_X, 88, 240, 42);
+    makeSignal(waiting, 12, 17, COLOR_DANGER);
+    makeLabel(waiting, "WAITING FOR HOST SNAPSHOT", 29, 11,
+              &lv_font_montserrat_14, COLOR_MUTED);
+  }
+
+  float peakCpu = -1.0f;
+  float hottest = -1.0f;
+  uint8_t activeIssues = 0;
+  if (snapshot.ready) {
+    activeIssues = snapshot.issues + snapshot.hostCount - snapshot.reachableHosts;
+  } else {
+    ++activeIssues;
+  }
+  if (metrics.ready) {
+    for (uint8_t index = 0; index < metrics.systemCount; ++index) {
+      const MetricSystem &system = metrics.systems[index];
+      if (system.cpu > peakCpu) peakCpu = system.cpu;
+      if (system.temperature > hottest) hottest = system.temperature;
+      if (metricIssueColor(system) != 0) ++activeIssues;
+    }
+  } else {
+    ++activeIssues;
+  }
+
+  lv_obj_t *rail = makePanel(10, 188, 460, 38);
+  constexpr const char *RAIL_LABELS[] = {"HOSTS", "WORKLOADS", "ISSUES",
+                                         "PEAK CPU", "HOTTEST"};
+  char railValues[5][14];
+  if (snapshot.ready) {
+    snprintf(railValues[0], sizeof(railValues[0]), "%u/%u",
+             snapshot.reachableHosts, snapshot.hostCount);
+    snprintf(railValues[1], sizeof(railValues[1]), "%u", snapshot.workloads);
+  } else {
+    strlcpy(railValues[0], "—", sizeof(railValues[0]));
+    strlcpy(railValues[1], "—", sizeof(railValues[1]));
+  }
+  snprintf(railValues[2], sizeof(railValues[2]), "%u", activeIssues);
+  if (peakCpu >= 0.0f) {
+    snprintf(railValues[3], sizeof(railValues[3]), "%.0f%%", peakCpu);
+  } else {
+    strlcpy(railValues[3], "—", sizeof(railValues[3]));
+  }
+  if (hottest >= 0.0f) {
+    snprintf(railValues[4], sizeof(railValues[4]), "%.0f°", hottest);
+  } else {
+    strlcpy(railValues[4], "—", sizeof(railValues[4]));
+  }
+
+  const uint32_t railColors[] = {
+      snapshot.ready ? overallColor() : COLOR_MUTED, COLOR_INK,
+      activeIssues ? COLOR_WARNING : COLOR_OK, COLOR_ACCENT,
+      hottest >= 75.0f ? COLOR_WARNING : COLOR_INK};
+  for (uint8_t index = 0; index < 5; ++index) {
+    const int16_t x = 8 + index * 90;
+    makeLabel(rail, RAIL_LABELS[index], x, 2, &lv_font_montserrat_14,
+              COLOR_MUTED);
+    makeLabel(rail, railValues[index], x, 19, &lv_font_montserrat_16,
+              railColors[index]);
+    if (index > 0) {
+      lv_obj_t *divider = lv_obj_create(rail);
+      clearObjectStyle(divider);
+      lv_obj_set_pos(divider, x - 8, 7);
+      lv_obj_set_size(divider, 1, 24);
+      lv_obj_set_style_bg_color(divider, color(COLOR_RULE), 0);
+      lv_obj_set_style_bg_opa(divider, LV_OPA_COVER, 0);
     }
   }
-
-  lv_obj_t *workloadPanel = makePanel(298, 118, 172, 104);
-  makeLabel(workloadPanel, "WORKLOADS", 12, 7, &lv_font_montserrat_14,
-            COLOR_MUTED);
-  char total[12];
-  snprintf(total, sizeof(total), "%u", snapshot.workloads);
-  makeLabel(workloadPanel, snapshot.ready ? total : "—", 12, 31,
-            &lv_font_montserrat_28, COLOR_INK);
-  char issueText[28];
-  snprintf(issueText, sizeof(issueText), "%u require attention", snapshot.issues);
-  makeLabel(workloadPanel, snapshot.ready ? issueText : "Waiting for data", 12, 76,
-            &lv_font_montserrat_14,
-            snapshot.issues ? COLOR_WARNING : COLOR_MUTED);
 }
 
 void metricSystemEvent(lv_event_t *event) {
@@ -520,38 +771,257 @@ void renderSystems() {
   }
 }
 
-void renderActions() {
-  makeLabel(content, "ACTIONS", 10, 10, &lv_font_montserrat_20, COLOR_INK);
-  makeLabel(content, "Control remains deliberately unavailable", 10, 38,
-            &lv_font_montserrat_14, COLOR_MUTED);
+void renderIssues() {
+  struct ActiveIssue {
+    const char *subject;
+    char detail[36];
+    uint32_t severityColor;
+  };
 
-  lv_obj_t *boundary = makePanel(10, 72, 460, 128);
-  makeSignal(boundary, 16, 21, COLOR_WARNING);
-  makeLabel(boundary, "READ-ONLY BOUNDARY", 34, 15,
-            &lv_font_montserrat_16, COLOR_WARNING);
-  makeLabel(boundary, "No Docker, Proxmox, UniFi, or NAS credentials are stored",
-            16, 51, &lv_font_montserrat_14, COLOR_INK);
-  makeLabel(boundary, "on this panel. Recovery actions require a separate allow-list",
-            16, 74, &lv_font_montserrat_14, COLOR_INK);
-  makeLabel(boundary, "and a hold-to-confirm interaction.", 16, 97,
-            &lv_font_montserrat_14, COLOR_MUTED);
+  ActiveIssue active[MAX_DOCKER_ISSUES + MAX_METRIC_SYSTEMS + 2];
+  uint8_t activeCount = 0;
+  auto addIssue = [&](const char *subject, const char *detail,
+                      uint32_t severityColor) {
+    if (activeCount >= sizeof(active) / sizeof(active[0])) return;
+    active[activeCount].subject = subject;
+    strlcpy(active[activeCount].detail, detail,
+            sizeof(active[activeCount].detail));
+    active[activeCount].severityColor = severityColor;
+    ++activeCount;
+  };
+
+  if (!snapshot.ready) {
+    addIssue("DOCKER FEED", snapshot.error, COLOR_DANGER);
+  } else {
+    for (uint8_t index = 0; index < snapshot.issueDetailCount; ++index) {
+      const DockerIssue &issue = snapshot.issueDetails[index];
+      addIssue(issue.subject, issue.detail, issue.severityColor);
+    }
+    if (feedIsStale(snapshot.ready, snapshot.fetchedAt, REFRESH_INTERVAL_MS))
+      addIssue("DOCKER FEED", "Snapshot is stale", COLOR_WARNING);
+  }
+
+  if (!metrics.ready) {
+    addIssue("BESZEL FEED", metrics.error, COLOR_DANGER);
+  } else {
+    for (uint8_t index = 0; index < metrics.systemCount; ++index) {
+      const MetricSystem &system = metrics.systems[index];
+      const uint32_t severityColor = metricIssueColor(system);
+      if (severityColor == 0) continue;
+      char detail[36];
+      formatMetricIssue(detail, sizeof(detail), system);
+      addIssue(system.name, detail, severityColor);
+    }
+    if (feedIsStale(metrics.ready, metrics.fetchedAt,
+                    METRICS_REFRESH_INTERVAL_MS))
+      addIssue("BESZEL FEED", "Snapshot is stale", COLOR_WARNING);
+  }
+
+  uint32_t summaryColor = activeCount ? COLOR_WARNING : COLOR_OK;
+  for (uint8_t index = 0; index < activeCount; ++index) {
+    if (active[index].severityColor == COLOR_DANGER) {
+      summaryColor = COLOR_DANGER;
+      break;
+    }
+  }
+
+  makeLabel(content, "ISSUES", 10, 4, &lv_font_montserrat_20, COLOR_INK);
+  char count[20];
+  snprintf(count, sizeof(count), "%u ACTIVE", activeCount);
+  lv_obj_t *countLabel = makeLabel(content, count, 0, 8,
+                                   &lv_font_montserrat_14, summaryColor);
+  lv_obj_align(countLabel, LV_ALIGN_TOP_RIGHT, -10, 8);
+
+  if (activeCount == 0) {
+    lv_obj_t *nominal = makePanel(10, 48, 460, 150);
+    makeSignal(nominal, 16, 25, COLOR_OK);
+    makeLabel(nominal, "NO ACTIVE ISSUES", 34, 18,
+              &lv_font_montserrat_20, COLOR_OK);
+    makeLabel(nominal, "Docker and Beszel are reporting normally.", 16, 61,
+              &lv_font_montserrat_16, COLOR_INK);
+    char dockerStatus[24];
+    char metricsStatus[24];
+    formatFeedStatus(dockerStatus, sizeof(dockerStatus), snapshot.ready,
+                     snapshot.fetchedAt, REFRESH_INTERVAL_MS);
+    formatFeedStatus(metricsStatus, sizeof(metricsStatus), metrics.ready,
+                     metrics.fetchedAt, METRICS_REFRESH_INTERVAL_MS);
+    char freshness[60];
+    snprintf(freshness, sizeof(freshness), "Docker %s · Beszel %s",
+             dockerStatus, metricsStatus);
+    makeLabel(nominal, freshness, 16, 101, &lv_font_montserrat_14,
+              COLOR_MUTED);
+    return;
+  }
+
+  const uint8_t visibleCount = min<uint8_t>(activeCount, 4);
+  for (uint8_t index = 0; index < visibleCount; ++index) {
+    lv_obj_t *row = makePanel(10, 42 + index * 43, 460, 38);
+    makeSignal(row, 10, 15, active[index].severityColor);
+    makeLabel(row, active[index].subject, 24, 10, &lv_font_montserrat_14,
+              COLOR_INK);
+    lv_obj_t *detail = makeLabel(row, active[index].detail, 0, 10,
+                                 &lv_font_montserrat_14,
+                                 active[index].severityColor);
+    lv_obj_align(detail, LV_ALIGN_TOP_RIGHT, -10, 10);
+  }
+  if (activeCount > visibleCount) {
+    char more[28];
+    snprintf(more, sizeof(more), "+ %u additional issues",
+             activeCount - visibleCount);
+    makeLabel(content, more, 10, 216, &lv_font_montserrat_14, COLOR_MUTED);
+  }
+}
+
+const char *weatherCondition(int code) {
+  if (code == 0) return "Clear";
+  if (code == 1) return "Mostly clear";
+  if (code == 2) return "Partly cloudy";
+  if (code == 3) return "Overcast";
+  if (code == 45 || code == 48) return "Fog";
+  if (code >= 51 && code <= 57) return "Drizzle";
+  if (code >= 61 && code <= 67) return "Rain";
+  if (code >= 71 && code <= 77) return "Snow";
+  if (code >= 80 && code <= 82) return "Showers";
+  if (code == 85 || code == 86) return "Snow showers";
+  if (code >= 95) return "Thunderstorms";
+  return "Unknown";
+}
+
+const char *windCompass(int degrees) {
+  static constexpr const char *DIRECTIONS[] = {"N", "NE", "E", "SE",
+                                                "S", "SW", "W", "NW"};
+  if (degrees < 0) return "—";
+  return DIRECTIONS[((degrees + 22) / 45) % 8];
+}
+
+int weekdayForDate(const char *isoDate) {
+  if (!isoDate || strlen(isoDate) < 10) return -1;
+  int year = atoi(isoDate);
+  int month = atoi(isoDate + 5);
+  const int day = atoi(isoDate + 8);
+  static constexpr int OFFSETS[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+  if (month < 3) --year;
+  return (year + year / 4 - year / 100 + year / 400 + OFFSETS[month - 1] +
+          day) % 7;
+}
+
+const char *weekday(const char *isoDate) {
+  static constexpr const char *DAYS[] = {"SUN", "MON", "TUE", "WED",
+                                         "THU", "FRI", "SAT"};
+  const int index = weekdayForDate(isoDate);
+  return index >= 0 ? DAYS[index] : "—";
+}
+
+lv_obj_t *makeWeatherPart(lv_obj_t *parent, int16_t x, int16_t y,
+                          int16_t width, int16_t height, uint32_t partColor,
+                          int16_t radius) {
+  lv_obj_t *part = lv_obj_create(parent);
+  clearObjectStyle(part);
+  lv_obj_set_pos(part, x, y);
+  lv_obj_set_size(part, width, height);
+  lv_obj_set_style_bg_color(part, color(partColor), 0);
+  lv_obj_set_style_bg_opa(part, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(part, radius, 0);
+  return part;
+}
+
+void makeSunGlyph(lv_obj_t *parent, int16_t x, int16_t y, uint8_t scale) {
+  const int16_t s = scale;
+  makeWeatherPart(parent, x + 8 * s, y + 8 * s, 10 * s, 10 * s,
+                  COLOR_WARNING, LV_RADIUS_CIRCLE);
+  makeWeatherPart(parent, x + 12 * s, y + 1 * s, 2 * s, 5 * s,
+                  COLOR_WARNING, s);
+  makeWeatherPart(parent, x + 12 * s, y + 20 * s, 2 * s, 5 * s,
+                  COLOR_WARNING, s);
+  makeWeatherPart(parent, x + 1 * s, y + 12 * s, 5 * s, 2 * s,
+                  COLOR_WARNING, s);
+  makeWeatherPart(parent, x + 20 * s, y + 12 * s, 5 * s, 2 * s,
+                  COLOR_WARNING, s);
+  makeWeatherPart(parent, x + 4 * s, y + 4 * s, 3 * s, 3 * s,
+                  COLOR_WARNING, LV_RADIUS_CIRCLE);
+  makeWeatherPart(parent, x + 19 * s, y + 4 * s, 3 * s, 3 * s,
+                  COLOR_WARNING, LV_RADIUS_CIRCLE);
+  makeWeatherPart(parent, x + 4 * s, y + 19 * s, 3 * s, 3 * s,
+                  COLOR_WARNING, LV_RADIUS_CIRCLE);
+  makeWeatherPart(parent, x + 19 * s, y + 19 * s, 3 * s, 3 * s,
+                  COLOR_WARNING, LV_RADIUS_CIRCLE);
+}
+
+void makeCloudGlyph(lv_obj_t *parent, int16_t x, int16_t y, uint8_t scale) {
+  const int16_t s = scale;
+  makeWeatherPart(parent, x + 3 * s, y + 8 * s, 10 * s, 10 * s,
+                  COLOR_MUTED, LV_RADIUS_CIRCLE);
+  makeWeatherPart(parent, x + 9 * s, y + 3 * s, 13 * s, 13 * s,
+                  COLOR_INK, LV_RADIUS_CIRCLE);
+  makeWeatherPart(parent, x + 17 * s, y + 8 * s, 10 * s, 10 * s,
+                  COLOR_MUTED, LV_RADIUS_CIRCLE);
+  makeWeatherPart(parent, x + 3 * s, y + 12 * s, 24 * s, 8 * s,
+                  COLOR_MUTED, 4 * s);
+}
+
+void makeWeatherGlyph(lv_obj_t *parent, int16_t x, int16_t y, int code,
+                      uint8_t scale) {
+  const int16_t s = scale;
+  const bool fog = code == 45 || code == 48;
+  const bool drizzle = code >= 51 && code <= 57;
+  const bool rain = (code >= 61 && code <= 67) ||
+                    (code >= 80 && code <= 82);
+  const bool snow = (code >= 71 && code <= 77) || code == 85 || code == 86;
+  const bool thunder = code >= 95;
+
+  if (code == 0) {
+    makeSunGlyph(parent, x, y, scale);
+    return;
+  }
+  if (code == 1 || code == 2) {
+    makeSunGlyph(parent, x, y, scale);
+    makeCloudGlyph(parent, x + 6 * s, y + 7 * s, scale);
+    return;
+  }
+
+  makeCloudGlyph(parent, x, y, scale);
+  if (fog) {
+    makeWeatherPart(parent, x + 4 * s, y + 23 * s, 22 * s, 2 * s,
+                    COLOR_MUTED, s);
+    makeWeatherPart(parent, x + 8 * s, y + 27 * s, 18 * s, 2 * s,
+                    COLOR_MUTED, s);
+  } else if (drizzle || rain) {
+    const int16_t dropHeight = (rain ? 7 : 4) * s;
+    makeWeatherPart(parent, x + 6 * s, y + 23 * s, 2 * s, dropHeight,
+                    COLOR_ACCENT, s);
+    makeWeatherPart(parent, x + 14 * s, y + 22 * s, 2 * s, dropHeight,
+                    COLOR_ACCENT, s);
+    makeWeatherPart(parent, x + 22 * s, y + 23 * s, 2 * s, dropHeight,
+                    COLOR_ACCENT, s);
+  } else if (snow) {
+    makeWeatherPart(parent, x + 5 * s, y + 23 * s, 4 * s, 4 * s,
+                    COLOR_ACCENT, LV_RADIUS_CIRCLE);
+    makeWeatherPart(parent, x + 13 * s, y + 27 * s, 4 * s, 4 * s,
+                    COLOR_INK, LV_RADIUS_CIRCLE);
+    makeWeatherPart(parent, x + 21 * s, y + 23 * s, 4 * s, 4 * s,
+                    COLOR_ACCENT, LV_RADIUS_CIRCLE);
+  } else if (thunder) {
+    makeWeatherPart(parent, x + 14 * s, y + 20 * s, 5 * s, 6 * s,
+                    COLOR_WARNING, s);
+    makeWeatherPart(parent, x + 10 * s, y + 25 * s, 6 * s, 5 * s,
+                    COLOR_WARNING, s);
+    makeWeatherPart(parent, x + 9 * s, y + 29 * s, 4 * s, 5 * s,
+                    COLOR_WARNING, s);
+  }
 }
 
 void renderDevice() {
   makeLabel(content, "DEVICE", 10, 10, &lv_font_montserrat_20, COLOR_INK);
-  makeLabel(content, "Panel network and runtime state", 10, 38,
+  makeLabel(content, "Panel hardware and runtime state", 10, 38,
             &lv_font_montserrat_14, COLOR_MUTED);
 
-  lv_obj_t *network = makePanel(10, 70, 278, 140);
-  makeLabel(network, "NETWORK", 12, 9, &lv_font_montserrat_14, COLOR_MUTED);
-  makeLabel(network, WiFi.isConnected() ? WiFi.SSID().c_str() : "Disconnected", 12,
-            34, &lv_font_montserrat_20,
-            WiFi.isConnected() ? COLOR_INK : COLOR_DANGER);
-  makeLabel(network, WiFi.isConnected() ? WiFi.localIP().toString().c_str() : "—",
-            12, 70, &lv_font_montserrat_16, COLOR_ACCENT);
-  char rssi[28];
-  snprintf(rssi, sizeof(rssi), "Signal %d dBm", WiFi.RSSI());
-  makeLabel(network, WiFi.isConnected() ? rssi : "Signal —", 12, 105,
+  lv_obj_t *hardware = makePanel(10, 70, 278, 140);
+  makeLabel(hardware, "HARDWARE", 12, 9, &lv_font_montserrat_14, COLOR_MUTED);
+  makeLabel(hardware, "ESP32-WROOM-32E", 12, 34, &lv_font_montserrat_20,
+            COLOR_INK);
+  makeLabel(hardware, "ST7796S · 480 × 320", 12, 76,
+            &lv_font_montserrat_14, COLOR_ACCENT);
+  makeLabel(hardware, "LVGL 8 · No PSRAM", 12, 105,
             &lv_font_montserrat_14, COLOR_MUTED);
 
   lv_obj_t *runtime = makePanel(298, 70, 172, 140);
@@ -564,7 +1034,74 @@ void renderDevice() {
   snprintf(heap, sizeof(heap), "%u KB heap",
            static_cast<unsigned>(ESP.getFreeHeap() / 1024));
   makeLabel(runtime, heap, 12, 78, &lv_font_montserrat_14, COLOR_MUTED);
-  makeLabel(runtime, "No PSRAM", 12, 105, &lv_font_montserrat_14, COLOR_MUTED);
+  makeLabel(runtime, "Read-only client", 12, 105, &lv_font_montserrat_14,
+            COLOR_MUTED);
+}
+
+void renderWeather() {
+  makeLabel(content, "WEATHER", 10, 4, &lv_font_montserrat_20, COLOR_INK);
+  const char *statusText = weather.loading
+                               ? "UPDATING"
+                               : (!weather.ready
+                                      ? "OFFLINE"
+                                      : (weather.error[0] ? "STALE" : "15 MIN"));
+  const uint32_t statusColor = !weather.ready
+                                   ? COLOR_DANGER
+                                   : (weather.error[0] ? COLOR_WARNING : COLOR_OK);
+  lv_obj_t *status = makeLabel(content, statusText, 0, 8,
+                               &lv_font_montserrat_14, statusColor);
+  lv_obj_align(status, LV_ALIGN_TOP_RIGHT, -10, 8);
+
+  if (!weather.ready) {
+    lv_obj_t *empty = makePanel(10, 48, 460, 150);
+    makeLabel(empty, "Weather unavailable", 16, 22, &lv_font_montserrat_20,
+              COLOR_INK);
+    makeLabel(empty, weather.error, 16, 62, &lv_font_montserrat_14,
+              COLOR_MUTED);
+    makeLabel(empty, "Open-Meteo retries every 60 seconds.", 16, 98,
+              &lv_font_montserrat_14, COLOR_MUTED);
+    return;
+  }
+
+  lv_obj_t *now = makePanel(10, 40, 190, 102);
+  makeLabel(now, "BILLERICA · NOW", 12, 8, &lv_font_montserrat_14,
+            COLOR_MUTED);
+  char temperature[16];
+  snprintf(temperature, sizeof(temperature), "%.0f°F", weather.temperature);
+  makeLabel(now, temperature, 12, 31, &lv_font_montserrat_28, COLOR_ACCENT);
+  makeLabel(now, weatherCondition(weather.code), 12, 73,
+            &lv_font_montserrat_14, COLOR_INK);
+  makeWeatherGlyph(now, 122, 30, weather.code, 2);
+
+  lv_obj_t *conditions = makePanel(210, 40, 260, 102);
+  makeLabel(conditions, "CURRENT CONDITIONS", 12, 8, &lv_font_montserrat_14,
+            COLOR_MUTED);
+  char detail[64];
+  snprintf(detail, sizeof(detail), "Feels %.0f°F · Humidity %.0f%%",
+           weather.apparent, weather.humidity);
+  makeLabel(conditions, detail, 12, 31, &lv_font_montserrat_16, COLOR_INK);
+  snprintf(detail, sizeof(detail), "Wind %.0f mph %s · Gust %.0f mph",
+           weather.wind, windCompass(weather.windDirection), weather.gust);
+  makeLabel(conditions, detail, 12, 57, &lv_font_montserrat_14, COLOR_MUTED);
+  snprintf(detail, sizeof(detail), "Pressure %.0f hPa · Observed %.5s",
+           weather.pressure,
+           strlen(weather.observedAt) >= 16 ? weather.observedAt + 11 : "—");
+  makeLabel(conditions, detail, 12, 79, &lv_font_montserrat_14, COLOR_MUTED);
+
+  for (uint8_t index = 0; index < FORECAST_DAYS; ++index) {
+    const DayForecast &day = weather.days[index];
+    lv_obj_t *forecast = makePanel(10 + index * 92, 150, 84, 76);
+    makeLabel(forecast, index == 0 ? "TODAY" : weekday(day.date), 8, 6,
+              &lv_font_montserrat_14, COLOR_MUTED);
+    makeWeatherGlyph(forecast, 50, 3, day.code, 1);
+    char highLow[20];
+    snprintf(highLow, sizeof(highLow), "%.0f / %.0f", day.high, day.low);
+    makeLabel(forecast, highLow, 8, 35, &lv_font_montserrat_16, COLOR_INK);
+    char rain[20];
+    snprintf(rain, sizeof(rain), "RAIN %d%%", day.precipitation);
+    makeLabel(forecast, rain, 8, 56, &lv_font_montserrat_14,
+              day.precipitation >= 40 ? COLOR_ACCENT : COLOR_MUTED);
+  }
 }
 
 void renderCurrentPage() {
@@ -572,8 +1109,9 @@ void renderCurrentPage() {
   switch (currentPage) {
     case Page::OVERVIEW: renderOverview(); break;
     case Page::SYSTEMS: renderSystems(); break;
-    case Page::ACTIONS: renderActions(); break;
+    case Page::ISSUES: renderIssues(); break;
     case Page::DEVICE: renderDevice(); break;
+    case Page::WEATHER: renderWeather(); break;
   }
   updateNavigation();
 }
@@ -627,12 +1165,13 @@ void buildUi() {
   lv_obj_set_style_border_width(navigation, 1, 0);
   lv_obj_set_style_border_side(navigation, LV_BORDER_SIDE_TOP, 0);
 
-  constexpr const char *labels[] = {"OVERVIEW", "SYSTEMS", "ACTIONS", "DEVICE"};
-  for (uint8_t index = 0; index < 4; ++index) {
+  constexpr const char *labels[] = {"OVERVIEW", "SYSTEMS", "ISSUES", "DEVICE",
+                                    "WEATHER"};
+  for (uint8_t index = 0; index < 5; ++index) {
     lv_obj_t *button = lv_btn_create(navigation);
     clearObjectStyle(button);
-    lv_obj_set_pos(button, index * 120, 0);
-    lv_obj_set_size(button, 120, NAV_HEIGHT);
+    lv_obj_set_pos(button, index * 96, 0);
+    lv_obj_set_size(button, 96, NAV_HEIGHT);
     lv_obj_set_style_bg_color(button, color(COLOR_SURFACE_RAISED), 0);
     lv_obj_set_style_bg_opa(button, LV_OPA_COVER, 0);
     lv_obj_set_style_text_font(button, &lv_font_montserrat_14, 0);
@@ -701,6 +1240,7 @@ bool loadSnapshot() {
   Snapshot next;
   next.loading = false;
   next.ready = true;
+  next.error[0] = '\0';
   next.fetchedAt = millis();
   strlcpy(next.generatedAt, document["generatedAt"] | "—",
           sizeof(next.generatedAt));
@@ -710,7 +1250,14 @@ bool loadSnapshot() {
     HostSummary &host = next.hosts[next.hostCount++];
     strlcpy(host.name, hostObject["name"] | "unknown", sizeof(host.name));
     host.reachable = strcmp(hostObject["status"] | "unreachable", "up") == 0;
-    if (host.reachable) ++next.reachableHosts;
+    if (host.reachable) {
+      ++next.reachableHosts;
+    } else if (next.issueDetailCount < MAX_DOCKER_ISSUES) {
+      DockerIssue &issue = next.issueDetails[next.issueDetailCount++];
+      strlcpy(issue.subject, host.name, sizeof(issue.subject));
+      strlcpy(issue.detail, "Host unreachable", sizeof(issue.detail));
+      issue.severityColor = COLOR_DANGER;
+    }
 
     for (JsonObject workload : hostObject["containers"].as<JsonArray>()) {
       ++host.workloads;
@@ -722,6 +1269,14 @@ bool loadSnapshot() {
       if (issue) {
         ++host.issues;
         ++next.issues;
+        if (next.issueDetailCount < MAX_DOCKER_ISSUES) {
+          DockerIssue &detail = next.issueDetails[next.issueDetailCount++];
+          strlcpy(detail.subject, workload["name"] | "container",
+                  sizeof(detail.subject));
+          snprintf(detail.detail, sizeof(detail.detail), "%s · %s", host.name,
+                   strcmp(state, "running") != 0 ? state : "unhealthy");
+          detail.severityColor = COLOR_DANGER;
+        }
       }
     }
   }
@@ -775,6 +1330,7 @@ bool loadMetricsSnapshot() {
   MetricsSnapshot next;
   next.loading = false;
   next.ready = true;
+  next.error[0] = '\0';
   next.fetchedAt = millis();
   strlcpy(next.generatedAt, document["generatedAt"] | "—",
           sizeof(next.generatedAt));
@@ -824,6 +1380,110 @@ bool loadMetricsSnapshot() {
   }
 
   metrics = next;
+  return true;
+}
+
+bool readWeatherNumber(JsonVariant value, float &destination) {
+  if (value.isNull()) return false;
+  destination = value.as<float>();
+  return !isnan(destination);
+}
+
+bool loadWeather() {
+  weather.loading = true;
+  weather.error[0] = '\0';
+
+  if (!WiFi.isConnected()) {
+    weather.loading = false;
+    strlcpy(weather.error, "Wi-Fi is disconnected", sizeof(weather.error));
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setConnectTimeout(7000);
+  http.setTimeout(12000);
+  http.useHTTP10(true);
+  if (!http.begin(client, WEATHER_URL)) {
+    weather.loading = false;
+    strlcpy(weather.error, "Could not initialize weather request",
+            sizeof(weather.error));
+    return false;
+  }
+  http.addHeader("User-Agent", "HomelabPanel/1.0");
+
+  const int status = http.GET();
+  if (status != HTTP_CODE_OK) {
+    weather.loading = false;
+    snprintf(weather.error, sizeof(weather.error), "Weather returned HTTP %d",
+             status);
+    Serial.printf("Weather request failed: HTTP %d, %s\n", status,
+                  http.errorToString(status).c_str());
+    http.end();
+    return false;
+  }
+
+  JsonDocument document;
+  const DeserializationError error = deserializeJson(document, http.getStream());
+  http.end();
+  if (error) {
+    weather.loading = false;
+    snprintf(weather.error, sizeof(weather.error), "Weather JSON: %s",
+             error.c_str());
+    return false;
+  }
+
+  WeatherSnapshot next;
+  JsonObject current = document["current"];
+  if (current.isNull() ||
+      !readWeatherNumber(current["temperature_2m"], next.temperature) ||
+      !readWeatherNumber(current["apparent_temperature"], next.apparent) ||
+      !readWeatherNumber(current["relative_humidity_2m"], next.humidity) ||
+      !readWeatherNumber(current["wind_speed_10m"], next.wind) ||
+      !readWeatherNumber(current["wind_gusts_10m"], next.gust) ||
+      !readWeatherNumber(current["pressure_msl"], next.pressure)) {
+    weather.loading = false;
+    strlcpy(weather.error, "Weather response omitted current conditions",
+            sizeof(weather.error));
+    return false;
+  }
+
+  strlcpy(next.observedAt, current["time"] | "", sizeof(next.observedAt));
+  next.code = current["weather_code"] | -1;
+  next.windDirection = current["wind_direction_10m"] | -1;
+
+  JsonObject daily = document["daily"];
+  JsonArray dates = daily["time"];
+  JsonArray codes = daily["weather_code"];
+  JsonArray highs = daily["temperature_2m_max"];
+  JsonArray lows = daily["temperature_2m_min"];
+  JsonArray rain = daily["precipitation_probability_max"];
+  if (dates.size() < FORECAST_DAYS || codes.size() < FORECAST_DAYS ||
+      highs.size() < FORECAST_DAYS || lows.size() < FORECAST_DAYS ||
+      rain.size() < FORECAST_DAYS) {
+    weather.loading = false;
+    strlcpy(weather.error, "Weather response omitted the five-day forecast",
+            sizeof(weather.error));
+    return false;
+  }
+
+  for (uint8_t index = 0; index < FORECAST_DAYS; ++index) {
+    DayForecast &day = next.days[index];
+    strlcpy(day.date, dates[index] | "", sizeof(day.date));
+    day.code = codes[index] | -1;
+    day.high = highs[index] | NAN;
+    day.low = lows[index] | NAN;
+    day.precipitation = rain[index] | -1;
+  }
+
+  next.ready = true;
+  next.loading = false;
+  next.error[0] = '\0';
+  next.fetchedAt = millis();
+  weather = next;
+  Serial.printf("Weather updated: %.1f F, %s\n", weather.temperature,
+                weatherCondition(weather.code));
   return true;
 }
 
@@ -946,6 +1606,8 @@ void setup() {
   lastRefreshAt = millis();
   loadMetricsSnapshot();
   lastMetricsRefreshAt = millis();
+  loadWeather();
+  lastWeatherAttemptAt = millis();
   renderCurrentPage();
   lv_label_set_text(networkLabel, WiFi.isConnected() ? "WIFI" : "OFFLINE");
   lv_obj_set_style_text_color(networkLabel,
@@ -970,6 +1632,13 @@ void loop() {
   if (millis() - lastMetricsRefreshAt >= METRICS_REFRESH_INTERVAL_MS) {
     loadMetricsSnapshot();
     lastMetricsRefreshAt = millis();
+    refreshed = true;
+  }
+  const uint32_t weatherInterval =
+      weather.error[0] ? WEATHER_RETRY_INTERVAL_MS : WEATHER_REFRESH_INTERVAL_MS;
+  if (millis() - lastWeatherAttemptAt >= weatherInterval) {
+    loadWeather();
+    lastWeatherAttemptAt = millis();
     refreshed = true;
   }
   if (refreshed) renderCurrentPage();
