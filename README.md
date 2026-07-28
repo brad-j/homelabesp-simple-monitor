@@ -29,6 +29,8 @@ The flashed and verified production firmware provides:
 - Tappable system cards with 60-minute CPU/memory charts
 - Billerica current conditions and five-day Open-Meteo forecast refreshed every 15 minutes
 - Overview, Systems, Issues, Device, and Weather screens
+- Animated Dreamstate screensaver after 30 seconds with a side-scrolling pixel-art shuttle, starfield, moon, and Earth limb
+- Neutral-dark operational theme with restrained orbital signal colors in Dreamstate
 - Backlight dim after 2 minutes, off after 10 minutes, and touch-to-wake
 - Wi-Fi modem sleep disabled for predictable latency while USB-powered
 
@@ -98,7 +100,7 @@ No graceful shutdown is required. The ESP32 has no conventional operating system
 - **Turn off:** disconnect USB-C or switch off its USB supply.
 - **Turn on:** restore USB power; startup and reconnection are automatic.
 - **Convenient switching:** use an inline USB power switch, switched hub, or smart plug on the USB adapter.
-- **Screen sleep:** dim at 2 minutes, backlight off at 10 minutes, touch to wake. The ESP32 remains online.
+- **Screen idle:** animated Dreamstate at 30 seconds, dim at 2 minutes, backlight off at 10 minutes, touch to wake. The ESP32 remains online.
 - **If a LiPo is connected:** removing USB may transfer power to the battery rather than shut the board down.
 
 Do not remove power while flashing firmware, saving new Wi-Fi configuration, or performing a future OTA update. Normal runtime power loss is safe.

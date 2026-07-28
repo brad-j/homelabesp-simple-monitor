@@ -1,8 +1,8 @@
 /* Hallmark · pre-emit critique: P5 H5 E5 S5 R5 V5
- * genre: modern-minimal · macrostructure: Workbench
- * theme: Cobalt-dark · enrichment: live topology + vector weather glyphs · navigation: bottom instrument rail
- * audience: homelab operators · use: health and guarded recovery · tone: technical
- * Hardware constraint: LVGL built-in Montserrat avoids external font assets on 4 MB/no-PSRAM.
+ * genre: atmospheric instrument UI · macrostructure: Workbench
+ * theme: Neutral-dark · enrichment: live topology + animated dreamstate · navigation: bottom instrument rail
+ * audience: one homelab operator · use: monitoring + ambient display · tone: technical/nocturnal
+ * Hardware constraint: LVGL built-in Montserrat and vector primitives avoid external assets on 4 MB/no-PSRAM.
  */
 
 #include <Arduino.h>
@@ -26,6 +26,7 @@ constexpr uint16_t BACKLIGHT_FREQUENCY_HZ = 5000;
 constexpr uint8_t BACKLIGHT_RESOLUTION_BITS = 8;
 constexpr uint8_t BACKLIGHT_ACTIVE = 220;
 constexpr uint8_t BACKLIGHT_DIMMED = 28;
+constexpr uint32_t SCREENSAVER_AFTER_MS = 30UL * 1000UL;
 constexpr uint32_t DIM_AFTER_MS = 2UL * 60UL * 1000UL;
 constexpr uint32_t SCREEN_OFF_AFTER_MS = 10UL * 60UL * 1000UL;
 
@@ -41,17 +42,20 @@ constexpr uint16_t TOUCH_RAW_X_RIGHT = 3761;
 constexpr uint16_t TOUCH_RAW_Y_TOP = 3700;
 constexpr uint16_t TOUCH_RAW_Y_BOTTOM = 264;
 
-// Locked Cobalt-dark tokens. RGB888 values are converted by LVGL/TFT_eSPI.
-constexpr uint32_t COLOR_PAPER = 0x0B1018;
-constexpr uint32_t COLOR_SURFACE = 0x131B26;
-constexpr uint32_t COLOR_SURFACE_RAISED = 0x192331;
-constexpr uint32_t COLOR_RULE = 0x2D3A4C;
-constexpr uint32_t COLOR_INK = 0xEDF3F8;
-constexpr uint32_t COLOR_MUTED = 0x91A0B2;
-constexpr uint32_t COLOR_ACCENT = 0x4C8DFF;
-constexpr uint32_t COLOR_OK = 0x56D3A2;
-constexpr uint32_t COLOR_WARNING = 0xF0B35A;
-constexpr uint32_t COLOR_DANGER = 0xFF7373;
+// Locked neutral-dark tokens. RGB888 values are converted by LVGL/TFT_eSPI.
+constexpr uint32_t COLOR_PAPER = 0x0C0C0E;
+constexpr uint32_t COLOR_SURFACE = 0x151518;
+constexpr uint32_t COLOR_SURFACE_RAISED = 0x1D1D21;
+constexpr uint32_t COLOR_RULE = 0x34343A;
+constexpr uint32_t COLOR_INK = 0xF0F0F2;
+constexpr uint32_t COLOR_MUTED = 0x92929C;
+constexpr uint32_t COLOR_ACCENT = 0xC7C9D1;
+constexpr uint32_t COLOR_OK = 0x5ECF9C;
+constexpr uint32_t COLOR_WARNING = 0xE5AE62;
+constexpr uint32_t COLOR_DANGER = 0xF07178;
+
+// Dreamstate-only accent. The operational UI remains neutral.
+constexpr uint32_t COLOR_DREAM_CYAN = 0x43E6D3;
 
 constexpr char SNAPSHOT_URL[] = HOMELAB_DOCKER_SNAPSHOT_URL;
 constexpr char METRICS_URL[] = HOMELAB_BESZEL_METRICS_URL;
@@ -162,6 +166,7 @@ lv_color_t drawPixels[SCREEN_WIDTH * DRAW_BUFFER_LINES];
 lv_obj_t *content = nullptr;
 lv_obj_t *networkLabel = nullptr;
 lv_obj_t *navButtons[5] = {};
+lv_obj_t *screensaverRoot = nullptr;
 Snapshot snapshot;
 MetricsSnapshot metrics;
 WeatherSnapshot weather;
@@ -172,7 +177,12 @@ uint32_t lastRefreshAt = 0;
 uint32_t lastMetricsRefreshAt = 0;
 uint32_t lastWeatherAttemptAt = 0;
 bool screenOff = false;
+bool screensaverActive = false;
+bool touchWasPressed = false;
 bool suppressTouchUntilRelease = false;
+
+void startScreensaver();
+void stopScreensaver();
 
 lv_color_t color(uint32_t token) {
   return lv_color_hex(token);
@@ -218,9 +228,12 @@ void readTouch(lv_indev_drv_t *, lv_indev_data_t *data) {
   const uint16_t pressure = display.getTouchRawZ();
   const bool pressed = digitalRead(PIN_TOUCH_IRQ) == LOW &&
                        pressure > TOUCH_PRESSURE_THRESHOLD;
+  const bool pressStarted = pressed && !touchWasPressed;
+  touchWasPressed = pressed;
 
-  if (screenOff && pressed) {
+  if ((screenOff || screensaverActive) && pressStarted) {
     screenOff = false;
+    stopScreensaver();
     suppressTouchUntilRelease = true;
     setBacklight(BACKLIGHT_ACTIVE);
     lastInteractionAt = millis();
@@ -236,8 +249,10 @@ void readTouch(lv_indev_drv_t *, lv_indev_data_t *data) {
     data->point.x = mapTouchX(rawY);
     data->point.y = mapTouchY(rawX);
     data->state = LV_INDEV_STATE_PR;
-    lastInteractionAt = millis();
-    if (!screenOff) setBacklight(BACKLIGHT_ACTIVE);
+    if (pressStarted) {
+      lastInteractionAt = millis();
+      setBacklight(BACKLIGHT_ACTIVE);
+    }
   } else {
     data->state = LV_INDEV_STATE_REL;
   }
@@ -430,6 +445,198 @@ void animateSignal(lv_obj_t *signal, uint32_t delayMs) {
   lv_anim_start(&animation);
 }
 
+void setScreensaverX(void *target, int32_t value) {
+  lv_obj_set_x(static_cast<lv_obj_t *>(target), value);
+}
+
+void setScreensaverY(void *target, int32_t value) {
+  lv_obj_set_y(static_cast<lv_obj_t *>(target), value);
+}
+
+void animateScreensaverAxis(lv_obj_t *object, lv_anim_exec_xcb_t callback,
+                            int32_t start, int32_t end, uint32_t duration,
+                            uint32_t delay = 0, bool playback = false,
+                            bool linear = false) {
+  lv_anim_t animation;
+  lv_anim_init(&animation);
+  lv_anim_set_var(&animation, object);
+  lv_anim_set_exec_cb(&animation, callback);
+  lv_anim_set_values(&animation, start, end);
+  lv_anim_set_time(&animation, duration);
+  lv_anim_set_delay(&animation, delay);
+  lv_anim_set_path_cb(&animation,
+                      linear ? lv_anim_path_linear : lv_anim_path_ease_in_out);
+  if (playback) lv_anim_set_playback_time(&animation, duration);
+  lv_anim_set_repeat_count(&animation, LV_ANIM_REPEAT_INFINITE);
+  lv_anim_start(&animation);
+}
+
+lv_obj_t *makeScreensaverPixel(lv_obj_t *parent, int16_t x, int16_t y,
+                               int16_t width, int16_t height,
+                               uint32_t pixelColor,
+                               lv_opa_t opacity = LV_OPA_COVER) {
+  lv_obj_t *pixel = lv_obj_create(parent);
+  clearObjectStyle(pixel);
+  lv_obj_set_pos(pixel, x, y);
+  lv_obj_set_size(pixel, width, height);
+  lv_obj_set_style_bg_color(pixel, color(pixelColor), 0);
+  lv_obj_set_style_bg_opa(pixel, opacity, 0);
+  lv_obj_set_style_radius(pixel, 0, 0);
+  return pixel;
+}
+
+void stopScreensaver() {
+  if (!screensaverActive) return;
+  screensaverActive = false;
+  Serial.printf("Dreamstate stopped at %lu ms\n",
+                static_cast<unsigned long>(millis()));
+  if (screensaverRoot) {
+    // Drop animated children synchronously before rebuilding the dashboard so
+    // both scenes never compete for LVGL's fixed 48 KB object heap.
+    lv_obj_clean(screensaverRoot);
+    lv_obj_add_flag(screensaverRoot, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_del_async(screensaverRoot);
+    screensaverRoot = nullptr;
+  }
+  renderCurrentPage();
+}
+
+void startScreensaver() {
+  if (screensaverActive || screenOff) return;
+  screensaverActive = true;
+  Serial.printf("Dreamstate starting after %lu ms idle; free heap %u bytes\n",
+                static_cast<unsigned long>(millis() - lastInteractionAt),
+                static_cast<unsigned>(ESP.getFreeHeap()));
+
+  // The live data remains in structs; release page objects while Dreamstate owns
+  // the display, then rebuild the selected page when the saver exits.
+  lv_obj_clean(content);
+  screensaverRoot = lv_obj_create(lv_layer_top());
+  clearObjectStyle(screensaverRoot);
+  lv_obj_set_pos(screensaverRoot, 0, 0);
+  lv_obj_set_size(screensaverRoot, SCREEN_WIDTH, SCREEN_HEIGHT);
+  lv_obj_set_style_bg_color(screensaverRoot, color(COLOR_PAPER), 0);
+  lv_obj_set_style_bg_opa(screensaverRoot, LV_OPA_COVER, 0);
+
+  // Side-scrolling pixel stars. Each is a hard-edged block on purpose.
+  for (uint8_t index = 0; index < 24; ++index) {
+    const int16_t startX = 8 + static_cast<int16_t>(esp_random() % 464U);
+    const int16_t y = 10 + static_cast<int16_t>(esp_random() % 246U);
+    const uint8_t size = index % 6 == 0 ? 4 : 2;
+    lv_obj_t *star = makeScreensaverPixel(
+        screensaverRoot, startX, y, size, size,
+        index % 8 == 0 ? COLOR_DREAM_CYAN : COLOR_INK,
+        index % 3 == 0 ? LV_OPA_COVER : LV_OPA_60);
+    animateScreensaverAxis(star, setScreensaverX, startX, -8,
+                           6500 + (esp_random() % 6500U),
+                           esp_random() % 3500U, false, true);
+    if (index % 6 == 0) animateSignal(star, index * 90U);
+  }
+
+  // A distant pixel moon assembled from stepped rows rather than a smooth circle.
+  lv_obj_t *moon = lv_obj_create(screensaverRoot);
+  clearObjectStyle(moon);
+  lv_obj_set_pos(moon, 382, 42);
+  lv_obj_set_size(moon, 72, 72);
+  makeScreensaverPixel(moon, 24, 0, 24, 8, COLOR_MUTED);
+  makeScreensaverPixel(moon, 8, 8, 56, 8, COLOR_MUTED);
+  makeScreensaverPixel(moon, 0, 16, 72, 40, COLOR_MUTED);
+  makeScreensaverPixel(moon, 8, 56, 56, 8, COLOR_MUTED);
+  makeScreensaverPixel(moon, 24, 64, 24, 8, COLOR_MUTED);
+  makeScreensaverPixel(moon, 8, 24, 16, 12, COLOR_RULE);
+  makeScreensaverPixel(moon, 42, 12, 12, 12, COLOR_RULE);
+  makeScreensaverPixel(moon, 44, 42, 20, 10, COLOR_RULE);
+  makeScreensaverPixel(moon, 22, 50, 10, 8, COLOR_SURFACE_RAISED);
+  animateScreensaverAxis(moon, setScreensaverY, 42, 50, 5200, 0, true);
+
+  // Pixel-art shuttle. All dimensions land on a four-pixel grid.
+  lv_obj_t *shuttle = lv_obj_create(screensaverRoot);
+  clearObjectStyle(shuttle);
+  lv_obj_set_pos(shuttle, 126, 102);
+  lv_obj_set_size(shuttle, 212, 104);
+
+  lv_obj_t *outerFlame = makeScreensaverPixel(
+      shuttle, 0, 44, 36, 16, COLOR_WARNING, LV_OPA_80);
+  makeScreensaverPixel(shuttle, 8, 40, 32, 24, COLOR_DANGER, LV_OPA_80);
+  lv_obj_t *innerFlame = makeScreensaverPixel(
+      shuttle, 12, 46, 28, 12, COLOR_INK, LV_OPA_COVER);
+  animateSignal(outerFlame, 0);
+  animateSignal(innerFlame, 320);
+
+  // Tail and vertical stabilizer.
+  makeScreensaverPixel(shuttle, 36, 28, 20, 44, COLOR_RULE);
+  makeScreensaverPixel(shuttle, 40, 32, 16, 36, COLOR_MUTED);
+  makeScreensaverPixel(shuttle, 36, 12, 24, 20, COLOR_RULE);
+  makeScreensaverPixel(shuttle, 44, 4, 16, 12, COLOR_RULE);
+  makeScreensaverPixel(shuttle, 40, 16, 16, 16, COLOR_INK);
+  makeScreensaverPixel(shuttle, 48, 8, 8, 8, COLOR_INK);
+
+  // Main fuselage and stepped nose.
+  makeScreensaverPixel(shuttle, 52, 24, 112, 52, COLOR_RULE);
+  makeScreensaverPixel(shuttle, 60, 20, 84, 4, COLOR_RULE);
+  makeScreensaverPixel(shuttle, 60, 28, 104, 44, COLOR_INK);
+  makeScreensaverPixel(shuttle, 68, 24, 72, 4, COLOR_INK);
+  makeScreensaverPixel(shuttle, 164, 28, 20, 44, COLOR_RULE);
+  makeScreensaverPixel(shuttle, 164, 32, 20, 36, COLOR_INK);
+  makeScreensaverPixel(shuttle, 184, 36, 16, 28, COLOR_RULE);
+  makeScreensaverPixel(shuttle, 184, 40, 16, 20, COLOR_INK);
+  makeScreensaverPixel(shuttle, 200, 44, 8, 12, COLOR_RULE);
+  makeScreensaverPixel(shuttle, 200, 48, 12, 4, COLOR_INK);
+
+  // Cockpit, cabin windows, and panel seams.
+  makeScreensaverPixel(shuttle, 140, 24, 28, 20, COLOR_RULE);
+  makeScreensaverPixel(shuttle, 144, 28, 20, 12, COLOR_DREAM_CYAN);
+  makeScreensaverPixel(shuttle, 84, 36, 12, 12, COLOR_SURFACE_RAISED);
+  makeScreensaverPixel(shuttle, 104, 36, 12, 12, COLOR_SURFACE_RAISED);
+  makeScreensaverPixel(shuttle, 124, 36, 12, 12, COLOR_SURFACE_RAISED);
+  makeScreensaverPixel(shuttle, 72, 56, 76, 4, COLOR_MUTED);
+  makeScreensaverPixel(shuttle, 100, 64, 4, 8, COLOR_RULE);
+  makeScreensaverPixel(shuttle, 132, 64, 4, 8, COLOR_RULE);
+
+  // Blocky wing silhouette and body fill.
+  makeScreensaverPixel(shuttle, 72, 72, 84, 12, COLOR_RULE);
+  makeScreensaverPixel(shuttle, 88, 84, 52, 12, COLOR_RULE);
+  makeScreensaverPixel(shuttle, 80, 72, 68, 8, COLOR_MUTED);
+  makeScreensaverPixel(shuttle, 96, 80, 36, 8, COLOR_MUTED);
+
+  lv_obj_t *navLight = makeScreensaverPixel(
+      shuttle, 192, 36, 4, 4, COLOR_DANGER, LV_OPA_COVER);
+  animateSignal(navLight, 180);
+  animateScreensaverAxis(shuttle, setScreensaverY, 102, 120, 4200, 0, true);
+  animateScreensaverAxis(shuttle, setScreensaverX, 126, 144, 7600, 0, true);
+
+  // Earth limb: a quiet pixel horizon beneath the shuttle.
+  makeScreensaverPixel(screensaverRoot, 0, 274, SCREEN_WIDTH, 4,
+                       COLOR_DREAM_CYAN, LV_OPA_50);
+  makeScreensaverPixel(screensaverRoot, 0, 278, SCREEN_WIDTH, 6,
+                       COLOR_MUTED, LV_OPA_60);
+  makeScreensaverPixel(screensaverRoot, 0, 284, SCREEN_WIDTH, 36,
+                       COLOR_SURFACE_RAISED);
+  constexpr int16_t LAND_X[] = {0, 40, 76, 132, 176, 236, 284, 344, 392, 444};
+  constexpr int16_t LAND_W[] = {28, 24, 40, 28, 44, 32, 44, 24, 36, 28};
+  constexpr int16_t LAND_H[] = {8, 14, 6, 18, 10, 16, 8, 20, 12, 6};
+  for (uint8_t index = 0; index < 10; ++index) {
+    makeScreensaverPixel(screensaverRoot, LAND_X[index], 284 - LAND_H[index],
+                         LAND_W[index], LAND_H[index], COLOR_SURFACE);
+  }
+  for (uint8_t index = 0; index < 8; ++index) {
+    makeScreensaverPixel(screensaverRoot, 22 + index * 61,
+                         294 + (index % 2) * 10, 6, 4,
+                         index % 3 == 0 ? COLOR_WARNING : COLOR_DREAM_CYAN,
+                         LV_OPA_60);
+  }
+
+  // One fast orbital streak gives the scene occasional depth.
+  lv_obj_t *streak = makeScreensaverPixel(
+      screensaverRoot, SCREEN_WIDTH + 30, 78, 34, 2, COLOR_INK, LV_OPA_60);
+  makeScreensaverPixel(streak, 28, -1, 6, 4, COLOR_DREAM_CYAN);
+  animateScreensaverAxis(streak, setScreensaverX, SCREEN_WIDTH + 30, -48,
+                         3200, 1700, false, true);
+
+  lv_obj_t *wake = makeLabel(screensaverRoot, "TOUCH TO WAKE", 14, 16,
+                             &lv_font_montserrat_14, COLOR_MUTED);
+  animateSignal(wake, 900);
+}
 void renderOverview() {
   makeLabel(content, "LIVE TOPOLOGY", 10, 3, &lv_font_montserrat_16,
             COLOR_INK);
@@ -1574,9 +1781,16 @@ void initializeLvgl() {
 void handleIdleDisplay() {
   const uint32_t idleFor = millis() - lastInteractionAt;
   if (!screenOff && idleFor >= SCREEN_OFF_AFTER_MS) {
+    stopScreensaver();
     setBacklight(0);
     screenOff = true;
-  } else if (!screenOff && idleFor >= DIM_AFTER_MS) {
+    return;
+  }
+  if (!screenOff && !screensaverActive && !touchWasPressed &&
+      idleFor >= SCREENSAVER_AFTER_MS) {
+    startScreensaver();
+  }
+  if (!screenOff && idleFor >= DIM_AFTER_MS) {
     setBacklight(BACKLIGHT_DIMMED);
   }
 }
@@ -1641,7 +1855,7 @@ void loop() {
     lastWeatherAttemptAt = millis();
     refreshed = true;
   }
-  if (refreshed) renderCurrentPage();
+  if (refreshed && !screensaverActive) renderCurrentPage();
 
   handleIdleDisplay();
   delay(5);
