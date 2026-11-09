@@ -10,3 +10,6 @@ include/secrets.h
 # Device images may contain credentials, keys, or proprietary firmware.
 backups/*
 !backups/*.sha256
+
+# Claude Code per-user permissions can hold literal credentials
+.claude/settings.local.json
